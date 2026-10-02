@@ -50,7 +50,6 @@ LEGACY_MARKER_TABLES = (
     "credential_rotations",
     "read_audit_events",
 )
-
 _BASELINE_NOTE = "初始建表（升级框架出现前旧库的基线补登，未重放任何变更）"
 
 
@@ -204,12 +203,33 @@ def _migrate_4_record_freezes(conn) -> None:
     )
 
 
+def _migrate_5_sensitive_phrases(conn) -> None:
+    """v5：敏感短语清单的单行配置表与初始“停用核验”清单行。
+
+    空库路径下 v1 的 create_all 已按当前模型建出该表（含单行 CHECK），此处
+    幂等补建并幂等插入固定单行：初始 phrases 为空数组（停用核验）、version=1，
+    既有数据没有任何敏感短语配置，全部既有发布/读取语义保持不变。已完成 v5
+    的库再次启动时单行已存在，ON CONFLICT 不重写任何内容。
+    """
+    Base.metadata.create_all(bind=conn, checkfirst=True)
+    conn.execute(
+        text(
+            """
+            INSERT INTO sensitive_phrase_settings (id, phrases, version, created_at)
+            VALUES (1, '[]'::jsonb, 1, now())
+            ON CONFLICT (id) DO NOTHING
+            """
+        )
+    )
+
+
 # (版本号, 版本名称, 升级函数)。追加新版本时只允许在末尾追加，永不改写历史版本。
 MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (1, "initial_schema", _migrate_1_initial_schema),
     (2, "historical_columns_and_rotation_chain", _migrate_2_historical_columns),
     (3, "audit_events_append_only", _migrate_3_audit_append_only),
     (4, "record_freezes", _migrate_4_record_freezes),
+    (5, "sensitive_phrases", _migrate_5_sensitive_phrases),
 )
 
 TARGET_SCHEMA_VERSION = MIGRATIONS[-1][0]

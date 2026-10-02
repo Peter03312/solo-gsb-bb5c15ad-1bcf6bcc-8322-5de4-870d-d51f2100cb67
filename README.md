@@ -19,6 +19,8 @@
 
 签发快照读取令牌时可**可选**地设置正整数**读取次数上限**（`max_reads`）：直接发布在请求时确定，受控发布在提交申请时冻结、批准签发后生效。公开读取沿用既有脱敏正文响应，每次凭有效令牌**成功读取**消耗一次；无效、撤销、到期、快照已撤回、令牌与快照不匹配或已达上限的请求不消耗次数。
 
+机构维护人员可凭服务密钥**原子替换并查询当前启用的敏感短语清单**（短语非空、清单内不重复；**空清单表示停用核验**）。直接发布与受控申请提交都按**拟发布版本的原文**做核验：对原文按 **Unicode 码点、区分大小写的字面量**（非正则）查找命中，**每个命中区间都必须被提交的遮蔽区间完整覆盖**，否则整次操作 `422` 拒绝，**不产生快照或令牌**，错误响应**只回未覆盖命中的码点位置，绝不回显短语或原文**。批准受控申请时，还要用**当时启用的清单**对**申请冻结的原文与区间**重新核验；不合格则申请保持待审（仍可驳回）。清单变更与发布并发时，发布事务对清单单行加行锁，**按同一已提交清单版本完成核验与提交**。清单变更**不改变已发布快照与既有凭证**，原有发布鉴权、成功响应与公开读取响应完全沿用既有约定。
+
 - 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16
 - 服务地址：`http://localhost:8000`（交互式文档：`http://localhost:8000/docs`）
 
@@ -46,8 +48,9 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 | 2 | `historical_columns_and_rotation_chain` | 历史缺列补齐（受控标记、快照撤回列、令牌次数/换发列、共享凭证换发列、受控申请策略列、删除早期冗余列），并为既有凭证回填稳定换发链标识 `chain_id` |
 | 3 | `audit_events_append_only` | 审计事件防改写约束：触发器拒绝任何 `UPDATE`/`DELETE`/`TRUNCATE` |
 | 4 | `record_freezes` | 记录临时冻结表 `record_freezes` 与“每条记录至多一个当前冻结期”的部分唯一索引；只新增结构，既有记录默认未冻结、全部快照继续按既有资格可读 |
+| 5 | `sensitive_phrases` | 敏感短语清单单行配置表 `sensitive_phrase_settings` 与初始“停用核验”行（空清单、版本 1）；只新增结构，既有发布/读取语义不变 |
 
-代码支持的最高版本为 4（`/readyz` 的 `supported_schema_version`）。**后续新增变更只能在升级链末尾追加新版本，不得改写历史版本。**
+代码支持的最高版本为 5（`/readyz` 的 `supported_schema_version`）。**后续新增变更只能在升级链末尾追加新版本，不得改写历史版本。**
 
 ### 升级流程与保证
 
@@ -56,8 +59,8 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 1. **等待数据库就绪**（按 `DB_CONNECT_RETRIES` / `DB_CONNECT_RETRY_DELAY_SECONDS` 重试）；
 2. 获取一把固定键的 **PostgreSQL 会话级咨询锁**（`pg_advisory_lock`）：多个实例同时启动时，**只有一个实例（领导者）进入升级**，其余实例在锁上排队等待；
 3. 判定起点：
-   - **空库**（无任何业务表）：从 v1 开始依次建表、补齐、安装防改写触发器、建冻结表；
-   - **升级框架出现前的旧库**（有业务表但无 `schema_migrations`）：把既有结构**补登为 v1 基线**（不重放建表、不重写数据），再增量执行 v2、v3、v4；
+   - **空库**（无任何业务表）：从 v1 开始依次建表、补齐、安装防改写触发器、建冻结表、建敏感短语配置表；
+   - **升级框架出现前的旧库**（有业务表但无 `schema_migrations`）：把既有结构**补登为 v1 基线**（不重放建表、不重写数据），再增量执行 v2、v3、v4、v5；
    - **已升级库**：只核对版本，不执行任何变更语句；
 4. **每个版本独立事务**：升级语句、数据回填与该版本记录原子提交；任一语句失败则整个版本回滚且**不登记**，修复后重启可从失败版本安全重试；
 5. 升级完成后核对库版本必须等于代码支持版本，然后释放咨询锁；排队的其余实例拿到锁后看到已是目标版本，仅做核对即放行。
@@ -85,7 +88,7 @@ docker compose up --build -d
 
 # 3) 等待该实例就绪（返回 200 且 schema_version 为目标版本）
 curl -fsS http://localhost:8000/readyz
-# => {"status":"ready","schema_version":4,"supported_schema_version":4}
+# => {"status":"ready","schema_version":5,"supported_schema_version":5}
 
 # 4) 核对升级记录
 docker compose exec db psql -U redact -d redact \
@@ -171,6 +174,8 @@ WHERE tgrelid = 'read_audit_events'::regclass AND tgname LIKE 'trg_read_audit_ev
 | `POST` | `/records/{record_id}/freeze` | 服务密钥 | **临时冻结记录**（首次需非空白 `reason`）：覆盖现有及期间新发布的全部快照；重复冻结幂等、不覆盖原因/开始时间 |
 | `GET` | `/records/{record_id}/freeze` | 服务密钥 | 查询当前冻结状态（当前冻结期开始时间、原因；未冻结时各字段为 null） |
 | `POST` | `/records/{record_id}/unfreeze` | 服务密钥 | **解除冻结**（幂等）：只恢复原本仍有效的读取资格，不复活失效凭证/额度/已撤回快照 |
+| `GET` | `/sensitive-phrases` | 服务密钥 | 查询当前启用的敏感短语清单（版本、短语、`enabled`；空清单即停用核验） |
+| `PUT` | `/sensitive-phrases` | 服务密钥 | **原子替换**敏感短语清单（短语非空、不重复；`[]` 停用核验），版本 +1 |
 | `POST` | `/bundle-requests` | operator | 提交多快照共享凭证申请：≥2 个互不重复快照 ID + 正整数 `max_reads`（可带到期策略），提交时冻结清单 |
 | `POST` | `/bundle-requests/{request_id}/approve` | reviewer（非申请人） | 批准：重新核对全部快照仍存在且未撤回，全部有效才一次性签发随机共享凭证 |
 | `POST` | `/bundle-requests/{request_id}/reject` | reviewer（非申请人） | 驳回共享凭证申请（可带 `reason`），终态，不签发凭证 |
@@ -358,6 +363,108 @@ curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<TOKEN>"
 
 ```bash
 ./examples/demo_freeze.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
+```
+
+## 敏感短语清单（发布前字面量命中核验）
+
+机构维护人员可维护一份**当前启用的敏感短语清单**，让服务在发布前对拟公开内容做最后一道核验：拟发布版本原文中的每个敏感短语命中，都必须已被提交的遮蔽区间**完整覆盖**，否则拒绝发布。
+
+### 清单维护（服务密钥）
+
+- **原子替换**：`PUT /sensitive-phrases`，请求体 `{"phrases": ["短语A", "短语B"]}`：
+  - 每个短语须**非空**（最长 200 字符），清单内**不得重复**（区分大小写，`"a"` 与 `"A"` 是两个不同短语），最多 500 个；否则 `422`；
+  - **空清单 `[]` 合法，表示停用核验**：停用后所有发布/申请不再做短语核验；
+  - 整份清单在同一事务原子替换并把 `version` **+1**（即使新内容与旧内容相同也产生新版本）；并发替换由清单单行的行锁串行化。
+- **查询**：`GET /sensitive-phrases`（服务密钥）返回：
+  ```json
+  {"version": 3, "phrases": ["短语A"], "enabled": true,
+   "created_at": "…", "updated_at": "…"}
+  ```
+  `enabled` 是便捷标志（`phrases` 非空即 `true`；空清单停用核验时为 `false`）。初始行为空清单、`version=1`、`updated_at=null`。
+- 鉴权沿用既有服务密钥约定：缺失/错误密钥一律 `401`。
+
+### 核验规则
+
+- **匹配方式**：对**拟发布版本的原文**按 **Unicode 码点**、**区分大小写**做**字面量**子串匹配（非正则，不做大小写折叠；BMP 之外的字符算 1 个码点）。允许重叠命中（短语 `"aaa"` 对原文 `"aaaa"` 命中 `[0,3)` 与 `[1,4)` 两处）。
+- **覆盖判定**：提交的遮蔽区间（左闭右开，与发布脱敏同一套区间）先按相交/相邻合并；**每个命中区间都必须整体落在某段遮蔽区间内**才算覆盖，只盖住一部分（部分覆盖）也算不通过。
+- **核验时点**：
+  - **直接发布** `POST /records/{id}/publish`：按请求版本的原文与该版本区间核验；
+  - **受控申请提交** `POST /records/{id}/publish-requests`：按拟发布历史版本的原文与区间核验，不通过则**不产生待审申请**；
+  - **受控申请批准** `POST /publish-requests/{id}/approve`：除既有检查外，用**批准当时启用的清单**对**申请冻结的原文与区间**重新核验（等待复核期间清单可能已变更）；不通过则**不产生快照或令牌，申请保持待审且仍可驳回**。
+  - 共享凭证申请/批准不再重复核验：它们引用的是**已发布快照的脱敏正文**，发布当时已核验。
+- **并发一致性**：发布（提交/批准）事务先对清单单行 `SELECT … FOR UPDATE` 加锁并在锁内完成核验，行锁持有到本次提交。与清单替换并发时由同一把行锁串行化，保证**发布按同一已提交清单版本完成核验和提交**——替换先提交则发布在获锁后按新清单核验，发布先提交则本次不受替换影响。加锁顺序恒为“清单行 → 快照行”，与库内其他事务同序，不会死锁。
+- **失败响应（不泄露内容）**：核验失败统一 `422`，且**只向有权调用方**（服务密钥的直接发布、持个人凭据的提交/批准）返回**未覆盖命中的码点区间**，**绝不回显任何短语或原文**：
+  ```json
+  {"detail": {"message": "sensitive phrase hits are not fully covered by redaction intervals",
+              "hits": [{"start": 10, "end": 28}]}}
+  ```
+  不合格则**拒绝本次操作，不产生快照或令牌**；待审申请在批准阶段失败时保持待审、仍可驳回。
+- **不回溯**：清单变更**不改变已发布快照（脱敏正文）与既有读取凭证**；已发布内容在清单变更后仍按既有公开读取约定访问，新清单只作用于之后的发布/提交/批准核验。
+- 记录创建/修订本身不核验（核验只发生在发布环节，针对拟发布版本）。
+
+### 状态码约定
+
+| 场景 | 状态码 |
+| --- | --- |
+| 缺失/错误服务密钥（GET/PUT）；受控接口凭据问题沿用各自约定 | `401` |
+| 清单含空短语/重复短语/超长；短语命中未被遮蔽区间完整覆盖（直接发布/提交/批准） | `422` |
+| 既有发布冲突（受控记录、已撤回版本、申请已终态等）沿用各自约定 | `409` 等 |
+| 查询/替换成功 | `200`；直接发布/申请提交成功沿用既有 `201` |
+
+### 调用示例
+
+```bash
+BASE=http://localhost:8000
+KEY=dev-service-key-change-me
+AUTH=(-H "X-Service-Key: $KEY" -H "Content-Type: application/json")
+
+# 1. 查询初始清单（空清单 = 停用核验）
+curl -sS "$BASE/sensitive-phrases" "${AUTH[@]}"
+# => {"version":1,"phrases":[],"enabled":false,"created_at":"…","updated_at":null}
+
+# 2. 原子替换：启用两个敏感短语
+curl -sS -X PUT "$BASE/sensitive-phrases" "${AUTH[@]}" \
+  -d '{"phrases": ["110101199003077777", "张三"]}'
+# => {"version":2,"phrases":["110101199003077777","张三"],"enabled":true,...}
+
+# 非法清单：空短语 / 重复短语 => 422
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$BASE/sensitive-phrases" "${AUTH[@]}" -d '{"phrases":[""]}'
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$BASE/sensitive-phrases" "${AUTH[@]}" -d '{"phrases":["a","a"]}'
+
+# 3. 创建记录（遮蔽姓名 [2,4) 与电话 [34,45)，未遮蔽身份证号）
+RID=$(curl -sS -X POST "$BASE/records" "${AUTH[@]}" -d '{
+  "text": "患者张三，身份证号 110101199003077777，联系电话 13800001111。",
+  "intervals": [{"start": 2, "end": 4}, {"start": 34, "end": 45}]
+}' | jq -r .record_id)
+
+# 4. 直接发布：身份证号命中 [10,28) 未被完整覆盖 => 422，只回命中位置
+curl -sS -X POST "$BASE/records/$RID/publish" "${AUTH[@]}" -d '{"version": 1}'
+# => 422 {"detail":{"message":"sensitive phrase hits are not fully covered by redaction intervals",
+#                   "hits":[{"start":10,"end":28}]}}   # 不回显短语或原文，且无快照/令牌产生
+
+# 5. 遮蔽区间完整覆盖命中后发布成功（姓名/身份证号都在遮蔽区间内）
+curl -sS -X PUT "$BASE/records/$RID" "${AUTH[@]}" -d '{
+  "base_version": 1,
+  "text": "患者张三，身份证号 110101199003077777，联系电话 13800001111。",
+  "intervals": [{"start": 2, "end": 4}, {"start": 10, "end": 28}, {"start": 34, "end": 45}]
+}' >/dev/null
+curl -sS -X POST "$BASE/records/$RID/publish" "${AUTH[@]}" -d '{"version": 2}'
+# => 201 既有发布成功响应（snapshot_id/token/...），鉴权与响应结构不变
+
+# 6. 停用核验：空清单后，未遮蔽任何短语的原文也可发布
+curl -sS -X PUT "$BASE/sensitive-phrases" "${AUTH[@]}" -d '{"phrases": []}'
+
+# 7. 受控申请：提交时按当前清单核验；批准时用“当时启用”的清单重新核验冻结原文
+#    （等待期间若新清单命中未覆盖区域，批准 422，申请保持待审、仍可驳回）
+
+# 8. 清单变更不影响已发布快照与既有令牌：公开读取响应完全不变
+curl -sS "$BASE/public/snapshots/<SID>?token=<TOKEN>"
+```
+
+完整端到端演示（含 401/422、区分大小写、部分覆盖不通过、停用核验、受控提交/批准两次核验、失败仍可驳回、已发布内容不受清单变更影响、清单与发布并发的行锁串行化）：
+
+```bash
+./examples/demo_phrases.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
 ```
 
 ## 受控发布（申请-复核）
@@ -739,7 +846,7 @@ KEY=dev-service-key-change-me
 
 # 1) 探针：就绪后才放流量；livez 在升级失败时仍可探活
 curl -fsS "$BASE/readyz"
-# => {"status":"ready","schema_version":4,"supported_schema_version":4}
+# => {"status":"ready","schema_version":5,"supported_schema_version":5}
 curl -s  "$BASE/livez"
 # => {"status":"alive","upgrade_status":"ready"}
 # 升级未就绪/失败时，除 /livez 外一律：
@@ -806,6 +913,13 @@ curl -s -H "X-Service-Key: $KEY" "$BASE/records/<RID>/freeze"
   - 冻结先 `SELECT ... FOR UPDATE` 锁记录行再核对/插入冻结行，重复冻结在记录锁内读到当前冻结期即幂等回放（`already_frozen=true`），并发冻结由记录行锁与部分唯一索引串行化，恰好一个首次结果；解除是一条原子条件 `UPDATE ... WHERE unfrozen_at IS NULL`，重复解除返回 `already_unfrozen=true`；
   - 公开读取在快照行锁（撤回判定）之后**再锁记录行**并在锁内以 `FOR UPDATE` 核对当前冻结期，锁序恒为“快照行 → 记录行 → 冻结行”，与冻结/换发事务同序，**串行化而不死锁**；命中冻结期即在任何计数 `UPDATE` 与审计写入之前返回模糊 `403`，**不扣次数、不写成功读取审计**，公开响应不透露冻结或原因；
   - 冻结按记录生效：覆盖该记录现有及冻结期间新发布的全部快照，却不影响共享凭证中**其他记录**的读取，也不撤销或改动任何凭证；解除不重置计数、不改凭证状态——已撤回快照、过期/撤销/换发凭证、耗尽额度均不复活。
+- **敏感短语清单核验**：
+  - 新表 `sensitive_phrase_settings` 为**全表单行**（固定 `id=1` + `CHECK (id=1)`），存放当前启用清单（JSONB 短语数组）与单调 `version`；v5 迁移幂等建表并插入初始空清单行（`phrases=[]`、`version=1`，即停用核验），既有数据与发布/读取语义不变；
+  - 清单由维护接口凭服务密钥**原子替换**（整份数组在同一事务更新并 `version=version+1`），非空/不重复/非空元素由请求模型校验；查询返回版本、短语与 `enabled` 标志；
+  - 匹配为按 **Unicode 码点、区分大小写的纯字面量**子串查找（`str.find`，非正则），每次命中只前进 1 个码点故**重叠命中全部报告**；提交区间按与脱敏一致的口径合并相交/相邻段，命中区间只有**整体落在某段内**才算被完整覆盖，部分覆盖也算未覆盖；
+  - 直接发布、受控申请提交与批准在写任何快照/令牌/申请之前调用核验：直接发布/提交按拟发布版本原文，**批准额外用当时启用清单重新核验申请冻结的原文与区间**；不通过统一 `422`，响应 `detail.hits` **只含未覆盖命中的码点区间，绝不回显短语或原文**，且不产生快照/令牌，待审申请保持待审仍可驳回；
+  - 发布（提交/批准）事务先 `SELECT … FOR UPDATE` 锁定清单单行并在锁内核验、持锁到提交：与清单替换由同一行锁串行化，保证**核验与提交对应同一已提交清单版本**；加锁顺序恒为“清单行 → 快照行”，与库内其他事务同序，不会死锁；
+  - 清单变更只影响之后的发布核验，**不回溯**：已发布快照的脱敏正文、既有令牌/共享凭证及其读取、计数、审计完全不变；空清单即停用核验。
 - **多快照共享凭证**：
   - 新表 `read_bundle_requests`（冻结清单 `frozen_snapshot_ids`、共享 `max_reads`、到期策略、申请/复核人与终态）、`read_bundles`（随机 `credential`、共享 `max_reads`/`reads_used`、到期与撤销）与 `read_bundle_items`（凭证-快照绑定与提交顺序）随 `create_all` 幂等创建，不改动既有表；
   - 清单在**提交时冻结**为 JSONB 快照 ID 数组（去重保序，至少 2 项，附 `jsonb_array_length >= 2` 与额度正整数检查约束）；批准时对全部快照行 `SELECT ... FOR UPDATE` **重新核对**仍存在且未撤回，任一失效即回滚本次批准、申请保持待审（仍可驳回）；
@@ -826,7 +940,7 @@ curl -s -H "X-Service-Key: $KEY" "$BASE/records/<RID>/freeze"
   - 表为只追加：启动迁移幂等安装触发器函数与行级/语句级触发器，拒绝任何 `UPDATE` / `DELETE` / `TRUNCATE`，应用层也无修改或删除入口；
   - 维护侧 `GET /snapshots/{id}/read-events`（服务密钥）按 `(snapshot_id, 时间窗口)` 过滤、按 `seq` 升序分页（索引 `(snapshot_id, seq)`），不透明游标承载窗口、页大小、`after_seq` 与首页快照——首页以查询开始时该快照已提交事件的最大 `seq` 为上界，配合公开读取“快照行锁串行提交”的性质，保证起点前已提交事件跨页**不重复、不遗漏**，查询期间新提交事件可留待下次查询；未知快照 `404`、非法窗口/游标 `422`、缺密钥 `401`。
 - **版本化数据库升级**：
-  - 版本表 `schema_migrations(version, name, applied_at)` 与升级链 v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录临时冻结表与部分唯一索引；空库从 v1 依次执行，升级框架出现前的旧库补登 v1 基线后只增量执行 v2/v3/v4，已升级库只核对；
+  - 版本表 `schema_migrations(version, name, applied_at)` 与升级链 v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录临时冻结表与部分唯一索引 / v5 敏感短语清单单行配置表与初始停用行；空库从 v1 依次执行，升级框架出现前的旧库补登 v1 基线后只增量执行 v2/v3/v4/v5，已升级库只核对；
   - 启动先取固定键的 PostgreSQL 会话级**咨询锁**：多实例并发只有一个执行升级，其余等待并在拿到锁后核对版本；进程崩溃则锁随连接释放，失败版本随事务回滚、未登记，重启可重试；
   - **每个版本独立事务**：DDL/回填与版本记录原子提交，已完成步骤绝不重放；回填只作用于 NULL 行，存量记录/快照/凭证、已用额度、换发链标识与审计事件均保留；
   - 升级后核对版本必须等于代码支持版本；库版本高于代码（未知较新版本）或升级失败时进入失败态，中间件对除 `/livez` 外的全部路径返回 `503`（不暴露鉴权/内部细节），`/readyz` 供编排就绪探针，修复后重启可恢复服务。
@@ -841,7 +955,7 @@ export DATABASE_URL=postgresql+psycopg2://redact:redact@localhost:5432/redact
 export REVIEW_CREDENTIALS='[{"username":"alice","password":"alice-pw","roles":["operator"]},{"username":"bob","password":"bob-pw","roles":["reviewer"]}]'
 uvicorn app.main:app --reload --port 8000
 
-# 脱敏核心逻辑单元测试（仅依赖标准库）
+# 脱敏与敏感短语字面量核验核心逻辑单元测试（仅依赖标准库）
 python3 -m unittest tests.test_redaction -v
 # 凭据配置校验单元测试
 python3 -m unittest tests.test_config -v
@@ -857,11 +971,11 @@ python3 -m unittest tests.test_migrations -v
 
 ```
 app/
-  main.py       # 路由与事务逻辑（受控发布、令牌计数、快照撤回、记录临时冻结、多快照共享凭证申请-复核与共用额度、凭证泄露换发、成功读取审计事件与分页查询）；启动门禁与 /livez /readyz /healthz
-  migrations.py # 有版本记录的数据库升级：schema_migrations 版本表 + 咨询锁；v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录冻结表与部分唯一索引
-  models.py     # records / record_versions / snapshots(含撤回字段) / record_freezes(冻结期) / read_tokens(含换发链) / publish_requests / read_bundles(+requests/items，含换发链) / credential_rotations / read_audit_events(只追加)
-  redaction.py  # 区间校验、合并、替换（纯函数）
-  schemas.py    # 请求/响应模型（含撤回、记录冻结、max_reads、多快照共享凭证、泄露换发与读取审计模型）
+  main.py       # 路由与事务逻辑（受控发布、令牌计数、快照撤回、记录临时冻结、多快照共享凭证申请-复核与共用额度、凭证泄露换发、成功读取审计事件与分页查询、敏感短语清单维护与发布核验）；启动门禁与 /livez /readyz /healthz
+  migrations.py # 有版本记录的数据库升级：schema_migrations 版本表 + 咨询锁；v1 建表 / v2 历史缺列补齐与链标识回填 / v3 审计防改写触发器 / v4 记录冻结表与部分唯一索引 / v5 敏感短语配置表
+  models.py     # records / record_versions / snapshots(含撤回字段) / record_freezes(冻结期) / read_tokens(含换发链) / publish_requests / read_bundles(+requests/items，含换发链) / credential_rotations / read_audit_events(只追加) / sensitive_phrase_settings(启用清单单行)
+  redaction.py  # 区间校验、合并、替换与敏感短语字面量命中/覆盖核验（纯函数）
+  schemas.py    # 请求/响应模型（含撤回、记录冻结、max_reads、多快照共享凭证、泄露换发、读取审计与敏感短语清单模型）
   security.py   # 服务密钥与操作者个人凭据（Basic）鉴权、角色依赖
   config.py     # 环境变量配置（含 REVIEW_CREDENTIALS 校验）
   db.py         # 引擎与会话
@@ -873,10 +987,11 @@ examples/
   demo_bundles.sh     # 多快照共享凭证（申请-复核 + 共用额度）端到端调用示例
   demo_rotate.sh      # 读取凭证泄露换发（令牌/共享凭证统一入口）端到端调用示例
   demo_audit.sh       # 成功读取审计（不可变事件 + 换发链 + 游标分页）端到端调用示例
+  demo_phrases.sh     # 敏感短语清单维护与发布/申请核验（含并发版本一致性）端到端调用示例
 tests/
-  test_redaction.py       # 脱敏逻辑单元测试
+  test_redaction.py       # 脱敏逻辑与敏感短语字面量命中/覆盖核验单元测试
   test_config.py          # 操作者凭据配置校验单元测试
-  test_integration_api.py # 受控/共享凭证/换发/读取审计/记录冻结/既有接口端到端集成测试（真实 PostgreSQL）
+  test_integration_api.py # 受控/共享凭证/换发/读取审计/记录冻结/敏感短语清单/既有接口端到端集成测试（真实 PostgreSQL）
   test_migrations.py      # 版本化升级流程集成测试（空库/旧库/并发/失败恢复/未知新版本，真实 PostgreSQL）
 Dockerfile / docker-compose.yml
 ```

@@ -413,6 +413,41 @@ AUDIT_KIND_TOKEN = ROTATION_KIND_TOKEN
 AUDIT_KIND_BUNDLE = ROTATION_KIND_BUNDLE
 
 
+# 敏感短语清单的固定单行主键（整表只允许这一行：当前启用的清单）
+SENSITIVE_PHRASE_SETTINGS_ID = 1
+
+
+class SensitivePhraseSettings(Base):
+    """当前启用的敏感短语清单（全表单例行，id 恒为 1）。
+
+    机构维护人员凭服务密钥原子替换整份清单；短语非空、清单内互不重复
+    （应用层校验）。空清单表示停用核验：发布/申请提交/申请批准均不再做
+    短语核验。version 从 1 起，每次成功替换 +1：发布事务对本行加 FOR UPDATE
+    锁并在锁内完成核验与提交，从而保证“按同一已提交清单版本完成核验和提交”——
+    清单变更与发布并发时，等待该行锁的发布必定在变更提交后按新清单重核。
+
+    清单变更只影响之后的发布核验：已发布快照（脱敏正文）与既有读取凭证
+    完全不变。
+    """
+
+    __tablename__ = "sensitive_phrase_settings"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_sensitive_phrase_settings_singleton"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 当前启用的敏感短语清单（JSONB 字符串数组，去重、非空元素）；[] 表示停用核验
+    phrases: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    # 清单版本：每次成功替换 +1，发布据此保证核验与提交对应同一已提交版本
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class ReadAuditEvent(Base):
     """已发布脱敏快照成功读取的不可变审计事件。
 

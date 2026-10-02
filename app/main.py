@@ -42,9 +42,16 @@ from .models import (
     RecordVersion,
     ROTATION_KIND_BUNDLE,
     ROTATION_KIND_TOKEN,
+    SENSITIVE_PHRASE_SETTINGS_ID,
+    SensitivePhraseSettings,
     Snapshot,
 )
-from .redaction import IntervalOutOfBoundsError, redact_text, validate_intervals
+from .redaction import (
+    IntervalOutOfBoundsError,
+    find_uncovered_phrase_hits,
+    redact_text,
+    validate_intervals,
+)
 from .schemas import (
     ApproveResponse,
     BundleApproveResponse,
@@ -80,6 +87,8 @@ from .schemas import (
     ReviewRejectRequest,
     RevokeResponse,
     RotationBundleItem,
+    SensitivePhraseListResponse,
+    SensitivePhraseReplaceRequest,
     SnapshotInfo,
     SnapshotWithdrawRequest,
     SnapshotWithdrawResponse,
@@ -165,8 +174,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.7.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 版本化数据库升级）",
+    version="1.8.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 版本化数据库升级）",
     lifespan=lifespan,
 )
 
@@ -200,6 +209,73 @@ def _validated_intervals(text: str, intervals: list[Interval]) -> list[tuple[int
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
+
+
+# ---- 敏感短语清单核验（直接发布与受控申请提交/批准均须通过） ----
+
+
+def _lock_sensitive_phrase_settings(db: Session) -> SensitivePhraseSettings:
+    """锁定敏感短语清单单行并返回当前已提交版本。
+
+    发布/申请提交/批准事务在整个核验与提交期间持有该行的 FOR UPDATE 行锁；
+    与清单的原子替换串行化，保证核验与提交对应同一已提交清单版本：
+    - 替换先提交：等待行锁的核验在获锁后看到新清单，按新版本核验；
+    - 核验先提交：替换在其后生效，本次发布仍按旧清单完成，不受影响。
+    """
+    settings_row = db.execute(
+        select(SensitivePhraseSettings)
+        .where(SensitivePhraseSettings.id == SENSITIVE_PHRASE_SETTINGS_ID)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if settings_row is None:
+        # 理论上 v5 迁移已幂等插入固定单行；缺失说明结构异常，不猜测、不放行
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="sensitive phrase settings are not initialized",
+        )
+    return settings_row
+
+
+def _verify_against_settings(
+    settings_row: SensitivePhraseSettings, text: str, intervals: list[tuple[int, int]]
+) -> None:
+    """在已锁定的清单版本上核验：空清单停用核验；命中未完整覆盖则 422。
+
+    失败时只抛错，由调用方回滚。错误体只含未覆盖命中的码点区间，绝不回显
+    任何短语或原文。
+    """
+    phrases = list(settings_row.phrases or [])
+    if not phrases:
+        return
+    uncovered = find_uncovered_phrase_hits(text, phrases, intervals)
+    if uncovered:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": "sensitive phrase hits are not fully covered by redaction intervals",
+                "hits": [{"start": s, "end": e} for s, e in uncovered],
+            },
+        )
+
+
+def _verify_phrases_cover_text(
+    db: Session, text: str, intervals: list[tuple[int, int]]
+) -> SensitivePhraseSettings:
+    """按当前启用清单核验原文：每个区分大小写的字面量命中都须被遮蔽区间完整覆盖。
+
+    先锁定清单单行（固定锁序的第一把锁）再在锁内核验，行锁持有至本次事务
+    提交/回滚，保证核验与提交对应同一已提交清单版本。核验失败统一 422 并回滚：
+    绝不回显任何短语或原文，且不产生快照、令牌或改变申请状态。返回锁定的
+    清单行，供需要在同一把锁后继续加其他行锁的调用方复用。
+    """
+    settings_row = _lock_sensitive_phrase_settings(db)
+    try:
+        _verify_against_settings(settings_row, text, intervals)
+    except HTTPException:
+        db.rollback()
+        raise
+    return settings_row
 
 
 def _future_expires_at(
@@ -450,9 +526,12 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
             status_code=status.HTTP_404_NOT_FOUND, detail="record version not found"
         )
     expires_at = _future_expires_at(payload.expires_in_seconds, payload.expires_at)
-    redacted = redact_text(
-        version.original_text, [(iv["start"], iv["end"]) for iv in version.intervals]
-    )
+    version_intervals = [(iv["start"], iv["end"]) for iv in version.intervals]
+    # 敏感短语核验：先锁清单单行并在锁内核验，行锁持有至本次发布提交，
+    # 保证核验与提交对应同一已提交清单版本（与清单替换并发时按事务先后串行）。
+    # 不通过则整次拒绝：不产生快照或令牌。
+    _verify_phrases_cover_text(db, version.original_text, version_intervals)
+    redacted = redact_text(version.original_text, version_intervals)
     # 快照按 (record_id, version) 唯一：并发发布时唯一约束保证只落库一份，
     # 且快照与令牌在同一事务提交，不会出现部分发布。
     db.execute(
@@ -533,12 +612,17 @@ def submit_publish_request(
     expires_at = payload.expires_at
     if expires_at is not None and expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
+    frozen_intervals = [dict(iv) for iv in version.intervals]
+    # 提交即须按当前启用清单核验拟发布版本原文：不通过整次拒绝，不产生待审申请。
+    _verify_phrases_cover_text(
+        db, version.original_text, [(iv["start"], iv["end"]) for iv in frozen_intervals]
+    )
     # 待审内容在此冻结：后续修订只产生新版本，不改变本申请绑定的原文与区间
     request = PublishRequestModel(
         record_id=record_id,
         version=payload.version,
         frozen_text=version.original_text,
-        frozen_intervals=[dict(iv) for iv in version.intervals],
+        frozen_intervals=frozen_intervals,
         status=REQUEST_PENDING,
         requested_by=operator.username,
         token_expires_in_seconds=payload.expires_in_seconds,
@@ -603,10 +687,12 @@ def approve_publish_request(
         )
     else:
         token_expires_at = request.token_expires_at
-    redacted = redact_text(
-        request.frozen_text,
-        [(iv["start"], iv["end"]) for iv in request.frozen_intervals],
-    )
+    frozen_intervals = [(iv["start"], iv["end"]) for iv in request.frozen_intervals]
+    # 批准时用“当时启用”的清单重新核验申请冻结的原文与区间（清单可能已在等待
+    # 期间变更）。先锁清单单行再锁快照行，锁序与直接发布一致、不会死锁；不通过
+    # 则整次拒绝：不产生快照或令牌，申请保持待审且仍可驳回。
+    _verify_phrases_cover_text(db, request.frozen_text, frozen_intervals)
+    redacted = redact_text(request.frozen_text, frozen_intervals)
     db.execute(
         pg_insert(Snapshot)
         .values(
@@ -1625,6 +1711,77 @@ def get_record_freeze(record_id: UUID, db: Session = Depends(get_db)):
         .order_by(RecordFreeze.frozen_at.desc())
     ).scalar_one_or_none()
     return _freeze_status_response(active, record_id)
+
+
+# ---- 敏感短语清单（机构维护侧：原子替换 + 查询；发布与申请提交/批准均核验） ----
+
+
+def _sensitive_phrase_list_response(row: SensitivePhraseSettings) -> SensitivePhraseListResponse:
+    """组装清单响应：空清单 enabled=false（停用核验）；只返回清单本身与版本元数据。"""
+    phrases = list(row.phrases or [])
+    return SensitivePhraseListResponse(
+        version=row.version,
+        phrases=phrases,
+        enabled=bool(phrases),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@app.get(
+    "/sensitive-phrases",
+    response_model=SensitivePhraseListResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def get_sensitive_phrases(db: Session = Depends(get_db)):
+    """查询当前启用的敏感短语清单（服务密钥）。
+
+    返回清单版本、短语数组、enabled 标志与时间元数据；空清单（[]）且
+    enabled=false 表示当前停用核验。缺/错密钥 401。
+    """
+    row = db.get(SensitivePhraseSettings, SENSITIVE_PHRASE_SETTINGS_ID)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="sensitive phrase settings are not initialized",
+        )
+    return _sensitive_phrase_list_response(row)
+
+
+@app.put(
+    "/sensitive-phrases",
+    response_model=SensitivePhraseListResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def replace_sensitive_phrases(
+    payload: SensitivePhraseReplaceRequest, db: Session = Depends(get_db)
+):
+    """凭服务密钥原子替换当前启用的敏感短语清单。
+
+    - 短语须非空、清单内不得重复（请求体 422）；空清单 [] 表示停用核验；
+    - 整份清单在同一事务替换并把 version +1：并发替换由固定单行的行锁串行化，
+      后提交者在前一已提交版本上继续递增，每次成功替换都是一个新已提交版本；
+    - 与发布并发时，发布事务持有同一行的 FOR UPDATE 锁完成核验与提交，本替换
+      在其提交后才生效，发布按其锁定的同一版本完成，不受本次替换影响；
+    - 缺/错密钥 401。清单变更不改变已发布快照与既有读取凭证。
+    """
+    row = db.execute(
+        select(SensitivePhraseSettings)
+        .where(SensitivePhraseSettings.id == SENSITIVE_PHRASE_SETTINGS_ID)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if row is None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="sensitive phrase settings are not initialized",
+        )
+    row.phrases = list(payload.phrases)
+    row.version = row.version + 1
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return _sensitive_phrase_list_response(row)
 
 
 @app.get("/public/snapshots/{snapshot_id}", response_model=PublicSnapshotResponse)

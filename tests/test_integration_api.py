@@ -3134,5 +3134,425 @@ class RecordFreezeIntegrationTests(unittest.TestCase):
         self.assertEqual(total, 1)
 
 
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class SensitivePhraseIntegrationTests(unittest.TestCase):
+    """敏感短语清单：原子替换/查询 + 发布与受控申请提交/批准核验 + 并发版本一致性。"""
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        # 复位为停用核验，避免影响其他测试类
+        cls.client.put("/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": []})
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        # 敏感短语清单是全局单行：每个用例前后复位为停用核验
+        r = self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": []}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def _create_record(self, text, intervals):
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": text, "intervals": intervals},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()["record_id"]
+
+    def _mark_controlled(self, rid):
+        r = self.client.put(f"/records/{rid}/controlled", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def _put_phrases(self, phrases):
+        return self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": phrases}
+        )
+
+    def _get_phrases(self):
+        return self.client.get("/sensitive-phrases", headers=SERVICE_HEADERS)
+
+    # ---- 清单维护：鉴权、初始状态、替换、校验 ----
+
+    def test_initial_list_is_empty_and_disabled(self):
+        # 全新初始化（本测试库首个用例）或复位后：空清单、停用核验、version>=1
+        r = self._get_phrases()
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["phrases"], [])
+        self.assertFalse(body["enabled"])
+        self.assertGreaterEqual(body["version"], 1)
+
+    def test_endpoints_require_service_key(self):
+        self.assertEqual(self.client.get("/sensitive-phrases").status_code, 401)
+        self.assertEqual(
+            self.client.put(
+                "/sensitive-phrases", json={"phrases": ["x"]}
+            ).status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.get(
+                "/sensitive-phrases", headers={"X-Service-Key": "wrong"}
+            ).status_code,
+            401,
+        )
+
+    def test_replace_atomically_returns_new_version(self):
+        r1 = self._put_phrases(["机密", "110101"])
+        self.assertEqual(r1.status_code, 200, r1.text)
+        b1 = r1.json()
+        self.assertEqual(b1["phrases"], ["机密", "110101"])
+        self.assertTrue(b1["enabled"])
+        self.assertIsNotNone(b1["updated_at"])
+        # 再次替换（即使内容相同）version 再 +1，整份清单原子切换
+        r2 = self._put_phrases(["机密", "110101"])
+        b2 = r2.json()
+        self.assertEqual(b2["version"], b1["version"] + 1)
+        self.assertEqual(b2["phrases"], ["机密", "110101"])
+        # 替换为完全不同的清单：旧短语不再出现
+        r3 = self._put_phrases(["另一个短语"])
+        self.assertEqual(r3.json()["phrases"], ["另一个短语"])
+        self.assertEqual(r3.json()["version"], b2["version"] + 1)
+
+    def test_empty_list_replaces_and_disables(self):
+        self._put_phrases(["机密"])
+        r = self._put_phrases([])
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["phrases"], [])
+        self.assertFalse(body["enabled"])
+
+    def test_invalid_payloads_422(self):
+        for bad in ([""], ["a", "a"]):  # 空短语；重复短语
+            r = self._put_phrases(bad)
+            self.assertEqual(r.status_code, 422, (bad, r.text))
+        # 缺字段
+        r = self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={}
+        )
+        self.assertEqual(r.status_code, 422)
+        # "a" 与 "A" 是两个不同短语（区分大小写）：允许
+        r = self._put_phrases(["a", "A"])
+        self.assertEqual(r.status_code, 200, r.text)
+
+    # ---- 直接发布核验 ----
+
+    def test_direct_publish_blocked_when_hit_uncovered(self):
+        rid = self._create_record(
+            "患者张三，身份证号 110101199003077777。",
+            [{"start": 2, "end": 4}],  # 只遮蔽姓名，未遮蔽身份证号
+        )
+        self._put_phrases(["110101199003077777"])
+        r = self.client.post(
+            f"/records/{rid}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        body = r.json()["detail"]
+        self.assertIsInstance(body, dict)
+        self.assertEqual(
+            body["hits"], [{"start": 10, "end": 28}]
+        )
+        # 不回显短语或原文
+        self.assertNotIn("110101199003077777", r.text)
+        self.assertNotIn("患者", r.text)
+        # 不产生快照或令牌
+        status = self.client.get(f"/records/{rid}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(status["snapshots"], [])
+
+    def test_direct_publish_allowed_when_hit_fully_covered(self):
+        rid = self._create_record(
+            "患者张三，身份证号 110101199003077777。",
+            [{"start": 10, "end": 28}],
+        )
+        self._put_phrases(["110101199003077777"])
+        r = self.client.post(
+            f"/records/{rid}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+
+    def test_partial_coverage_still_uncovered(self):
+        rid = self._create_record(
+            "患者张三，身份证号 110101199003077777。",
+            [{"start": 10, "end": 20}],  # 只遮蔽命中的一部分
+        )
+        self._put_phrases(["110101199003077777"])
+        r = self.client.post(
+            f"/records/{rid}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["detail"]["hits"], [{"start": 10, "end": 28}])
+
+    def test_case_sensitive_matching(self):
+        rid = self._create_record("令牌ABC内容", [])
+        # 小写短语不应命中大写原文：发布成功
+        self._put_phrases(["abc"])
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        # 大写短语命中且未遮蔽：拒绝
+        self._put_phrases(["ABC"])
+        # 版本 1 已发布（快照已存在）；换一条新记录验证大写命中
+        rid2 = self._create_record("令牌ABC内容", [])
+        r = self.client.post(
+            f"/records/{rid2}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["detail"]["hits"], [{"start": 2, "end": 5}])
+
+    def test_empty_list_disables_verification(self):
+        rid = self._create_record("完全未遮蔽的机密内容。", [])
+        # 空清单：停用核验，直接发布成功
+        self._put_phrases([])
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+
+    def test_overlapping_phrase_hits_reported(self):
+        rid = self._create_record("aaaa内容", [])
+        self._put_phrases(["aaa"])
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(
+            r.json()["detail"]["hits"], [{"start": 0, "end": 3}, {"start": 1, "end": 4}]
+        )
+
+    def test_multiple_hits_positions(self):
+        rid = self._create_record("机密一与机密二", [])
+        self._put_phrases(["机密"])
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        # 机(0)密(1)一(2)与(3)机(4)密(5)二(6)
+        self.assertEqual(
+            r.json()["detail"]["hits"], [{"start": 0, "end": 2}, {"start": 4, "end": 6}]
+        )
+
+    # ---- 受控申请：提交核验 + 批准时按当时清单重新核验 ----
+
+    def test_controlled_submit_verified(self):
+        rid = self._create_record("受控机密内容。", [])
+        self._mark_controlled(rid)
+        self._put_phrases(["机密"])
+        r = self.client.post(
+            f"/records/{rid}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["detail"]["hits"], [{"start": 2, "end": 4}])
+        # 待审申请没有产生
+        listing = self.client.get(
+            f"/records/{rid}/publish-requests", auth=BASIC_ALICE
+        ).json()
+        self.assertEqual(listing["requests"], [])
+
+    def test_controlled_approve_rechecks_with_current_list(self):
+        rid = self._create_record("受控机密内容。", [{"start": 2, "end": 4}])
+        self._mark_controlled(rid)
+        # 提交时清单为空（停用核验）：申请成功
+        self._put_phrases([])
+        r = self.client.post(
+            f"/records/{rid}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        prid = r.json()["request_id"]
+        # 等待期间启用不含命中的清单：批准时用当时清单重新核验冻结原文，通过
+        self._put_phrases(["秘密"])  # 原文无“秘密”：核验通过
+        r = self.client.post(f"/publish-requests/{prid}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["token"])
+
+        # 第二条记录的申请：等待期间加入命中短语，批准必须 422 且申请仍待审可驳回
+        rid2 = self._create_record("受控机密内容。", [{"start": 2, "end": 4}])
+        self._mark_controlled(rid2)
+        self._put_phrases([])  # 提交时停用
+        r = self.client.post(
+            f"/records/{rid2}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        prid2 = r.json()["request_id"]
+        # 批准前启用清单：“受控”位于 [0,2)，未被 [2,4) 遮蔽 -> 按当时清单重新核验失败
+        self._put_phrases(["受控"])
+        r = self.client.post(f"/publish-requests/{prid2}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["detail"]["hits"], [{"start": 0, "end": 2}])
+        self.assertNotIn("受控", r.text)
+        # 不产生新快照/令牌
+        status = self.client.get(f"/records/{rid2}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(status["snapshots"], [])
+        # 申请保持待审：仍可驳回
+        r = self.client.post(
+            f"/publish-requests/{prid2}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "清单已启用，遮蔽不全"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "rejected")
+
+    def test_list_change_does_not_affect_published_snapshot_and_token(self):
+        rid = self._create_record("历史发布内容。", [])
+        # 清单为空时发布成功
+        self._put_phrases([])
+        pub = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        ).json()
+        sid, token = pub["snapshot_id"], pub["token"]
+        # 发布后再启用包含原文短语的清单：已发布快照与令牌不受影响，公开仍可读
+        self._put_phrases(["历史发布"])
+        r = self.client.get(f"/public/snapshots/{sid}?token={token}")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["redacted_text"], "历史发布内容。")
+
+    # ---- 并发：发布按同一已提交清单版本完成核验与提交 ----
+
+    def test_replace_blocks_until_publishing_transaction_commits(self):
+        """确定性制造重叠：先在独立事务持有清单行锁（模拟发布事务进行中），
+        此时 PUT 替换必须阻塞；持锁期间 GET 仍读到旧清单；持锁提交后 PUT 完成、
+        版本递增。证明替换与发布由同一行锁串行化。
+        """
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        self._put_phrases(["旧短语"])
+        version_before = self._get_phrases().json()["version"]
+
+        holder_ready = threading.Event()
+        release_holder = threading.Event()
+
+        def hold_settings_lock():
+            session = SessionLocal()
+            try:
+                session.execute(
+                    sql_text(
+                        "SELECT id FROM sensitive_phrase_settings "
+                        "WHERE id = 1 FOR UPDATE"
+                    )
+                )
+                holder_ready.set()
+                release_holder.wait(timeout=10)
+                session.commit()
+            finally:
+                session.close()
+
+        holder = threading.Thread(target=hold_settings_lock)
+        holder.start()
+        self.assertTrue(holder_ready.wait(timeout=10))
+
+        result = {}
+
+        def replace():
+            client = TestClient(app_main.app)
+            r = client.put(
+                "/sensitive-phrases",
+                headers=SERVICE_HEADERS,
+                json={"phrases": ["新短语"]},
+            )
+            result["status"] = r.status_code
+            result["body"] = r.json() if r.status_code == 200 else r.text
+
+        t = threading.Thread(target=replace)
+        t.start()
+        time.sleep(0.7)
+        # 替换仍被行锁阻塞、未完成
+        self.assertNotIn("status", result)
+        # 行锁未提交：其他请求读到的仍是旧清单版本
+        cur = self._get_phrases().json()
+        self.assertEqual(cur["version"], version_before)
+        self.assertEqual(cur["phrases"], ["旧短语"])
+
+        release_holder.set()
+        holder.join(timeout=10)
+        t.join(timeout=10)
+        self.assertEqual(result["status"], 200, result)
+        self.assertEqual(result["body"]["version"], version_before + 1)
+        self.assertEqual(result["body"]["phrases"], ["新短语"])
+
+    def test_concurrent_publish_and_replace_commit_consistent_versions(self):
+        """压力场景：发布事务与清单替换并发，每个发布要么整体按旧清单、要么整体
+        按新清单核验并提交；不应出现按混合状态产生的结果。新清单命中未遮蔽内容，
+        故通过的发布数 + 被拒发布数恒等于尝试次数，且一旦新清单生效后所有后续
+        发布都被拒绝（没有漏网）。
+        """
+        rid = self._create_record("并发机密内容。", [])
+        self._put_phrases([])  # 初始停用：发布可通过
+
+        outcomes: list[int] = []
+        barrier = threading.Barrier(11)
+
+        def publish_once():
+            client = TestClient(app_main.app)
+            barrier.wait()
+            r = client.post(
+                f"/records/{rid}/publish",
+                headers=SERVICE_HEADERS,
+                json={"version": 1},
+            )
+            outcomes.append(r.status_code)
+
+        def enable_list():
+            client = TestClient(app_main.app)
+            barrier.wait()
+            time.sleep(0.05)  # 让部分发布先按旧清单进入/完成
+            client.put(
+                "/sensitive-phrases",
+                headers=SERVICE_HEADERS,
+                json={"phrases": ["机密"]},
+            )
+
+        threads = [threading.Thread(target=publish_once) for _ in range(10)]
+        threads.append(threading.Thread(target=enable_list))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(outcomes), 10)
+        self.assertTrue(all(c in (201, 409, 422) for c in outcomes), outcomes)
+        # 同一版本只有一份不可变快照：首个成功发布 201，其后旧清单下的重复发布
+        # 是正常的重复发布路径；关键不变量是——新清单生效后不可能再有 201，
+        # 即最后一个非冲突结果必须是 422，且 422 之后不出现 201。
+        meaningful = [c for c in outcomes if c != 409]
+        if 422 in meaningful:
+            first_reject = meaningful.index(422)
+            self.assertNotIn(201, meaningful[first_reject:], outcomes)
+
+    def test_rejected_publish_leaves_no_snapshot_but_retry_after_disable_succeeds(self):
+        rid = self._create_record("临时机密内容。", [])
+        self._put_phrases(["机密"])
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        )
+        self.assertEqual(r.status_code, 422)
+        # 停用核验后重试同一版本：成功发布
+        self._put_phrases([])
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+
+
 if __name__ == "__main__":
     unittest.main()
