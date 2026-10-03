@@ -3134,5 +3134,377 @@ class RecordFreezeIntegrationTests(unittest.TestCase):
         self.assertEqual(total, 1)
 
 
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class SensitivePhraseListIntegrationTests(unittest.TestCase):
+    """敏感短语清单：原子替换/查询、发布前三处核验、失败语义与并发串行化。"""
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        # 清单是全局状态：每个用例从“空清单（停用核验）”开始，避免相互干扰
+        r = self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": []}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": TEXT_V1, "intervals": INTERVALS_V1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.record_id = r.json()["record_id"]
+
+    def tearDown(self):
+        # 还原为空清单（停用核验），不影响其他测试类
+        self.client.put("/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": []})
+
+    # ---- 工具方法 ----
+
+    def _replace(self, phrases, expected=200):
+        r = self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": phrases}
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _get_list(self, expected=200):
+        r = self.client.get("/sensitive-phrases", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _publish(self, version=1, expected=201):
+        r = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": version},
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _mark_controlled(self):
+        r = self.client.put(
+            f"/records/{self.record_id}/controlled", headers=SERVICE_HEADERS
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    # ---- 清单替换与查询 ----
+
+    def test_replace_and_query_roundtrip_with_version_increments(self):
+        initial = self._get_list().json()
+        self.assertEqual(initial["phrases"], [])
+        self.assertFalse(initial["enabled"])
+
+        r1 = self._replace(["张三", "110101199003077777"]).json()
+        self.assertEqual(r1["phrases"], ["张三", "110101199003077777"])
+        self.assertTrue(r1["enabled"])
+        self.assertEqual(r1["version"], initial["version"] + 1)
+        self.assertIsNotNone(r1["updated_at"])
+
+        got = self._get_list().json()
+        self.assertEqual(got["phrases"], r1["phrases"])
+        self.assertEqual(got["version"], r1["version"])
+
+        # 空清单表示停用核验；每次成功替换版本 +1
+        r2 = self._replace([]).json()
+        self.assertEqual(r2["phrases"], [])
+        self.assertFalse(r2["enabled"])
+        self.assertEqual(r2["version"], r1["version"] + 1)
+
+    def test_endpoints_require_service_key(self):
+        r = self.client.get("/sensitive-phrases")
+        self.assertEqual(r.status_code, 401)
+        r = self.client.put("/sensitive-phrases", json={"phrases": ["x"]})
+        self.assertEqual(r.status_code, 401)
+        r = self.client.put(
+            "/sensitive-phrases",
+            headers={"X-Service-Key": "wrong"},
+            json={"phrases": ["x"]},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_invalid_lists_rejected_and_state_unchanged(self):
+        self._replace(["张三"])
+        before = self._get_list().json()
+        # 空短语、清单内重复一律 422，且原清单与版本保持不变
+        for bad in ([""], ["张三", "张三"], ["a", "b", "a"], ["", "b"]):
+            r = self.client.put(
+                "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": bad}
+            )
+            self.assertEqual(r.status_code, 422, (bad, r.text))
+        after = self._get_list().json()
+        self.assertEqual(after, before)
+
+    # ---- 直接发布核验 ----
+
+    def test_direct_publish_requires_full_coverage(self):
+        # “身份证号”=[5,9) 不在 INTERVALS_V1 的遮蔽区间内
+        self._replace(["张三", "身份证号"])
+        r = self._publish(expected=422)
+        self.assertEqual(r.json()["detail"]["hits"], [{"start": 5, "end": 9}])
+        # 不产生快照或令牌
+        r = self.client.get(f"/records/{self.record_id}", headers=SERVICE_HEADERS)
+        self.assertEqual(r.json()["snapshots"], [])
+        # 修订补齐遮蔽区间后发布成功
+        r = self.client.put(
+            f"/records/{self.record_id}",
+            headers=SERVICE_HEADERS,
+            json={
+                "base_version": 1,
+                "text": TEXT_V1,
+                "intervals": INTERVALS_V1 + [{"start": 5, "end": 9}],
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self._publish(version=2)
+        self.assertEqual(r.json()["status"], "published")
+        self.assertIn("token", r.json())
+
+    def test_publish_failure_response_leaks_only_positions(self):
+        self._replace(["身份证号"])
+        r = self._publish(expected=422)
+        # 只回命中位置：不回显短语或原文
+        self.assertNotIn("身份证号", r.text)
+        self.assertNotIn(TEXT_V1, r.text)
+        detail = r.json()["detail"]
+        self.assertEqual(set(detail.keys()), {"message", "hits"})
+        self.assertEqual(detail["hits"], [{"start": 5, "end": 9}])
+
+    def test_empty_list_disables_check(self):
+        self._replace(["敏感词ABC"])
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": "完全不同的新原文，敏感词ABC。", "intervals": []},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        rid = r.json()["record_id"]
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        # 空清单停用核验后，同一版本即可发布
+        self._replace([])
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+
+    def test_create_and_revise_are_not_blocked_by_phrase_list(self):
+        # 核验只发生在发布路径：创建与修订不拦截
+        self._replace(["身份证号"])
+        r = self.client.post(
+            "/records", headers=SERVICE_HEADERS, json={"text": TEXT_V1, "intervals": []}
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        rid = r.json()["record_id"]
+        r = self.client.put(
+            f"/records/{rid}",
+            headers=SERVICE_HEADERS,
+            json={"base_version": 1, "text": TEXT_V1, "intervals": INTERVALS_V1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    # ---- 受控申请提交与批准核验 ----
+
+    def test_controlled_submit_checked_against_active_list(self):
+        self._mark_controlled()
+        self._replace(["身份证号"])
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["detail"]["hits"], [{"start": 5, "end": 9}])
+        # 不生成申请
+        r = self.client.get(
+            f"/records/{self.record_id}/publish-requests", auth=BASIC_ALICE
+        )
+        self.assertEqual(r.json()["requests"], [])
+        # 清单只含已覆盖短语时可提交
+        self._replace(["张三"])
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+
+    def test_approve_rechecks_frozen_content_with_then_active_list(self):
+        self._mark_controlled()
+        # 提交时清单为空（停用），申请冻结原文与区间
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        request_id = r.json()["request_id"]
+        # 批准前替换清单：冻结原文中“身份证号”[5,9) 未被遮蔽 -> 批准 422
+        self._replace(["身份证号"])
+        r = self.client.post(f"/publish-requests/{request_id}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["detail"]["hits"], [{"start": 5, "end": 9}])
+        # 申请保持待审、未生成快照，且仍可驳回
+        info = self.client.get(f"/publish-requests/{request_id}", auth=BASIC_ALICE).json()
+        self.assertEqual(info["status"], "pending")
+        self.assertIsNone(info["snapshot_id"])
+        r = self.client.post(
+            f"/publish-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "核验未通过"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "rejected")
+
+    def test_approve_succeeds_once_list_allows_frozen_content(self):
+        self._mark_controlled()
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        request_id = r.json()["request_id"]
+        self._replace(["身份证号"])
+        r = self.client.post(f"/publish-requests/{request_id}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 422, r.text)
+        # 清单停用（或改为只含已覆盖短语）后，同一申请可批准并签发令牌
+        self._replace([])
+        r = self.client.post(f"/publish-requests/{request_id}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["status"], "approved")
+        read = self.client.get(
+            f"/public/snapshots/{body['snapshot_id']}?token={body['token']}"
+        )
+        self.assertEqual(read.status_code, 200, read.text)
+
+    # ---- 清单变更不影响已发布快照与既有凭证 ----
+
+    def test_list_change_does_not_affect_published_snapshots_or_tokens(self):
+        self._replace(["张三"])  # 张三 [2,4) 已被 INTERVALS_V1 覆盖
+        published = self._publish().json()
+        sid, token = published["snapshot_id"], published["token"]
+        # 替换为含未覆盖短语的清单：已发布快照与既有令牌不受影响
+        self._replace(["身份证号"])
+        r = self.client.get(f"/public/snapshots/{sid}?token={token}")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            r.json()["redacted_text"],
+            "患者[已遮蔽]，身份证号 [已遮蔽]，联系电话 [已遮蔽]。",
+        )
+
+    # ---- 并发：替换与发布按同一已提交清单版本串行化 ----
+
+    def test_list_replace_waits_for_ongoing_publish_verification(self):
+        from sqlalchemy import create_engine, select
+        from sqlalchemy import text as sql_text
+        from sqlalchemy.exc import OperationalError
+
+        from app.db import SessionLocal
+        from app.models import SensitivePhraseList
+
+        self._replace(["敏感"])
+
+        verifier = SessionLocal()
+        try:
+            # 模拟发布核验：对清单行持有 FOR SHARE 锁（事务未提交）
+            phrases = verifier.execute(
+                select(SensitivePhraseList.phrases)
+                .where(SensitivePhraseList.id == 1)
+                .with_for_update(read=True)
+            ).scalar_one()
+            self.assertEqual(phrases, ["敏感"])
+
+            # 另一连接上的替换必须等待共享锁释放：极短 lock_timeout 下确定性失败
+            blocking_engine = create_engine(
+                os.environ["DATABASE_URL"],
+                connect_args={"options": "-c lock_timeout=300"},
+            )
+            try:
+                with blocking_engine.connect() as conn:
+                    with self.assertRaises(OperationalError):
+                        conn.execute(
+                            sql_text(
+                                "UPDATE sensitive_phrase_lists "
+                                "SET phrases = '[]'::jsonb WHERE id = 1"
+                            )
+                        )
+            finally:
+                blocking_engine.dispose()
+        finally:
+            verifier.rollback()  # 释放共享锁
+            verifier.close()
+
+        # 锁释放后替换成功
+        self._replace([])
+
+    def test_concurrent_replace_and_publish_never_mix_list_versions(self):
+        # 原文：敏感词=[0,3) 已遮蔽；ABC=[3,6) 未遮蔽
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": "敏感词ABC。", "intervals": [{"start": 0, "end": 3}]},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        rid = r.json()["record_id"]
+        self._replace(["敏感词"])
+        stop = threading.Event()
+        outcomes: list = []
+        barrier = threading.Barrier(10)
+
+        def flip_list():
+            client = TestClient(app_main.app)
+            barrier.wait()
+            n = 0
+            while not stop.is_set():
+                n += 1
+                phrases = ["敏感词"] if n % 2 == 0 else ["敏感词", "ABC"]
+                client.put(
+                    "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": phrases}
+                )
+
+        def publish():
+            client = TestClient(app_main.app)
+            barrier.wait()
+            outcomes.append(
+                client.post(
+                    f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+                )
+            )
+
+        flippers = [threading.Thread(target=flip_list) for _ in range(2)]
+        publishers = [threading.Thread(target=publish) for _ in range(8)]
+        for t in flippers + publishers:
+            t.start()
+        for t in publishers:
+            t.join()
+        stop.set()
+        for t in flippers:
+            t.join()
+
+        self.assertEqual(len(outcomes), 8)
+        for r in outcomes:
+            if r.status_code == 201:
+                # 按同一份已提交清单版本完成核验与提交：快照与令牌完整可用
+                body = r.json()
+                read = self.client.get(
+                    f"/public/snapshots/{body['snapshot_id']}?token={body['token']}"
+                )
+                self.assertEqual(read.status_code, 200, read.text)
+            else:
+                # 不合格：只回命中位置（恰为未覆盖的 ABC），不产生快照或令牌
+                self.assertEqual(r.status_code, 422, r.text)
+                self.assertEqual(r.json()["detail"]["hits"], [{"start": 3, "end": 6}])
+
+
 if __name__ == "__main__":
     unittest.main()

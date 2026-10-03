@@ -204,12 +204,30 @@ def _migrate_4_record_freezes(conn) -> None:
     )
 
 
+def _migrate_5_sensitive_phrase_lists(conn) -> None:
+    """v5：敏感短语清单单行表与种子行（空清单 = 停用核验）。
+
+    空库路径下 v1 的 create_all 已按当前模型建出该表，此处幂等；旧库路径
+    按当前模型补齐整表。种子行（id=1、空清单）保证发布核验与清单替换始终
+    能在同一行上以行锁串行化（行锁需要已存在的行）；既有库升级后清单为空、
+    核验停用，发布行为与升级前完全一致，不触碰任何既有数据。
+    """
+    Base.metadata.create_all(bind=conn, checkfirst=True)
+    conn.execute(
+        text(
+            "INSERT INTO sensitive_phrase_lists (id, version, phrases, updated_at) "
+            "VALUES (1, 0, '[]'::jsonb, now()) ON CONFLICT (id) DO NOTHING"
+        )
+    )
+
+
 # (版本号, 版本名称, 升级函数)。追加新版本时只允许在末尾追加，永不改写历史版本。
 MIGRATIONS: tuple[tuple[int, str, callable], ...] = (
     (1, "initial_schema", _migrate_1_initial_schema),
     (2, "historical_columns_and_rotation_chain", _migrate_2_historical_columns),
     (3, "audit_events_append_only", _migrate_3_audit_append_only),
     (4, "record_freezes", _migrate_4_record_freezes),
+    (5, "sensitive_phrase_lists", _migrate_5_sensitive_phrase_lists),
 )
 
 TARGET_SCHEMA_VERSION = MIGRATIONS[-1][0]

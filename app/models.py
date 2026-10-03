@@ -463,3 +463,34 @@ class ReadAuditEvent(Base):
         UUID(as_uuid=True), nullable=False
     )
 
+
+class SensitivePhraseList(Base):
+    """启用的敏感短语清单（全表单行，id 恒为 1）：维护侧原子替换、版本递增。
+
+    - phrases：JSONB 字符串数组，元素非空且清单内不重复（替换时校验）；
+      空数组表示停用发布前短语核验（既有库升级后默认如此，发布行为不变）；
+    - version：单调递增，每次成功替换 +1，用于观测“已提交清单版本”；
+    - 发布核验（直接发布/受控申请提交/批准）以 FOR SHARE 读取本行：
+      行锁持有到事务提交，替换（UPDATE）与核验串行化，保证核验与快照/令牌
+      提交针对同一份已提交清单版本；
+    - 清单只影响替换之后的发布核验：不改变已发布快照与既有凭证。
+    """
+
+    __tablename__ = "sensitive_phrase_lists"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_sensitive_phrase_lists_singleton"),
+    )
+
+    # 单行表：主键恒为 1（迁移 v5 写入种子行）
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 清单版本：每次成功替换 +1
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 启用的敏感短语（JSONB 字符串数组）；空数组 = 停用核验
+    phrases: Mapped[list] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+

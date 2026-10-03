@@ -403,3 +403,37 @@ class ReadAuditEventPage(BaseModel):
     # 下一页游标：本页已填满且仍有后续事件时非空，否则为 null
     next_cursor: str | None = None
 
+
+# ---- 敏感短语清单（维护侧原子替换/查询；发布前核验） ----
+
+
+class SensitivePhraseListReplaceRequest(BaseModel):
+    """原子替换启用的敏感短语清单。
+
+    短语须非空、清单内不得重复；空清单表示停用发布前短语核验。
+    """
+
+    phrases: list[str] = Field(max_length=500)
+
+    @model_validator(mode="after")
+    def _non_empty_and_unique(self):
+        for phrase in self.phrases:
+            if not phrase:
+                raise ValueError("phrases must not contain empty phrases")
+            if len(phrase) > 200:
+                raise ValueError("phrase must not exceed 200 characters")
+        if len(set(self.phrases)) != len(self.phrases):
+            raise ValueError("phrases must not contain duplicates")
+        return self
+
+
+class SensitivePhraseListResponse(BaseModel):
+    """当前启用的敏感短语清单（仅维护侧可见；空清单表示停用核验）。"""
+
+    # 清单版本：每次成功替换 +1（从未替换过为 0）
+    version: int
+    # 是否启用发布前短语核验（清单非空即启用）
+    enabled: bool
+    phrases: list[str]
+    updated_at: datetime | None = None
+

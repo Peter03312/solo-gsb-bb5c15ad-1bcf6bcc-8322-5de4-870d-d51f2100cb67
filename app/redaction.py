@@ -1,4 +1,4 @@
-"""敏感区间校验、合并与脱敏替换。
+"""敏感区间校验、合并与脱敏替换，以及敏感短语命中覆盖核验。
 
 区间约定：左闭右开 [start, end)，位置按 Unicode 码点计，
 与 Python 字符串的下标语义一致（包括对 BMP 之外的字符）。
@@ -44,3 +44,43 @@ def redact_text(text: str, intervals: list[tuple[int, int]]) -> str:
         cursor = end
     parts.append(text[cursor:])
     return "".join(parts)
+
+
+def _is_fully_covered(merged: list[tuple[int, int]], start: int, end: int) -> bool:
+    """命中区间 [start, end) 是否被某个合并后的遮蔽区间完整覆盖。"""
+    for m_start, m_end in merged:
+        if m_start > start:
+            break  # 合并区间按起点排序，后续区间不可能再覆盖 start
+        if end <= m_end:
+            return True
+    return False
+
+
+def find_uncovered_hits(
+    text: str, intervals: list[tuple[int, int]], phrases: list[str]
+) -> list[tuple[int, int]]:
+    """找出未被遮蔽区间完整覆盖的敏感短语命中区间（按起点排序）。
+
+    - 查找按 Unicode 码点、区分大小写的字面量匹配（与 str.find 语义一致）；
+    - 同一短语的重叠命中各自计入（如 "aa" 在 "aaa" 中命中 [0, 2) 与 [1, 3)）；
+    - 每个命中区间 [start, end) 须被某个（相交/相邻合并后的）遮蔽区间完整覆盖；
+    - 空清单（核验停用）或空原文返回空列表；清单中的空短语被忽略
+      （空短语在清单替换时已被拒绝，此处仅作防御）。
+    """
+    if not phrases or not text:
+        return []
+    merged = merge_intervals(intervals)
+    hits: list[tuple[int, int]] = []
+    for phrase in phrases:
+        if not phrase:
+            continue
+        start = 0
+        while True:
+            index = text.find(phrase, start)
+            if index < 0:
+                break
+            end = index + len(phrase)
+            if not _is_fully_covered(merged, index, end):
+                hits.append((index, end))
+            start = index + 1
+    return sorted(hits)
